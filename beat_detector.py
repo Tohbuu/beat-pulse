@@ -20,23 +20,8 @@ class BeatDetector:
         print(f"Loading audio file: {file_path}")
         
         try:
-            # Method 1: Try using soundfile first (more reliable for MP3)
-            try:
-                audio, sr = sf.read(file_path)
-                # If stereo, convert to mono
-                if len(audio.shape) > 1:
-                    audio = np.mean(audio, axis=1)
-                # Resample if necessary
-                if sr != self.sample_rate:
-                    import librosa
-                    audio = librosa.resample(audio, orig_sr=sr, target_sr=self.sample_rate)
-                    sr = self.sample_rate
-                    
-            except Exception as e:
-                print(f"SoundFile failed, trying Librosa: {e}")
-                # Method 2: Use librosa as fallback
-                import librosa
-                audio, sr = librosa.load(file_path, sr=self.sample_rate, mono=True)
+            # Use librosa for all audio file types
+            audio, sr = librosa.load(file_path, sr=self.sample_rate, mono=True)
             
             print(f"Audio loaded: {len(audio)/sr:.2f} seconds, Sample rate: {sr} Hz")
             return audio, sr
@@ -45,17 +30,38 @@ class BeatDetector:
             print(f"Error loading audio: {e}")
             return None, None
     
-    def bandpass_filter(self, audio, lowcut=80, highcut=16000):
+    def bandpass_filter(self, audio, lowcut=100, highcut=4000):
         """Apply bandpass filter to focus on percussive elements"""
         print("Applying bandpass filter...")
-        nyquist = self.sample_rate / 2
-        low = lowcut / nyquist
-        high = highcut / nyquist
         
-        # Butterworth bandpass filter
-        b, a = butter(4, [low, high], btype='band')
-        filtered_audio = filtfilt(b, a, audio)
-        return filtered_audio
+        # Calculate Nyquist frequency
+        nyquist = self.sample_rate / 2
+        
+        # Normalize frequencies to 0-1 range (as fraction of Nyquist)
+        low_normalized = lowcut / nyquist
+        high_normalized = highcut / nyquist
+        
+        # Ensure frequencies are within valid range (0 to 1)
+        low_normalized = max(0.001, min(0.499, low_normalized))
+        high_normalized = max(0.002, min(0.499, high_normalized))
+        
+        # Ensure low < high
+        if low_normalized >= high_normalized:
+            high_normalized = low_normalized + 0.01
+        
+        print(f"  Filter range: {lowcut}-{highcut} Hz")
+        print(f"  Normalized: {low_normalized:.4f}-{high_normalized:.4f}")
+        
+        try:
+            # Butterworth bandpass filter (lower order for stability)
+            b, a = butter(2, [low_normalized, high_normalized], btype='band')
+            filtered_audio = filtfilt(b, a, audio)
+            print("  ✓ Filter applied successfully")
+            return filtered_audio
+        except Exception as e:
+            print(f"  ⚠️  Filter failed: {e}")
+            print("  Returning original audio")
+            return audio
     
     def compute_energy(self, audio):
         """Compute energy envelope of the signal"""
@@ -98,56 +104,170 @@ class BeatDetector:
         
         return np.array(flux)
     
-    def detect_beats(self, energy_signal, threshold_factor=1.5):
-        """Detect beats from energy signal"""
-        # Dynamic threshold
-        threshold = np.mean(energy_signal) * threshold_factor
-        
-        # Find peaks that exceed threshold
-        min_distance = self.sample_rate // (self.hop_size * 4)  # Prevent too close beats
-        peaks, properties = find_peaks(energy_signal, height=threshold, distance=min_distance)
-        
-        print(f"Detected {len(peaks)} beats with threshold factor {threshold_factor}")
+    def detect_beats(self, energy_signal, threshold_factor=1.3, method='energy'):
+        """Detect beats from energy signal with improved parameters"""
+        # Use a combination of mean and median for robust thresholding
+        mean_energy = np.mean(energy_signal)
+        median_energy = np.median(energy_signal)
+        threshold = max(mean_energy, median_energy) * threshold_factor
+
+        # Adjust minimum distance based on expected tempo range
+        # For music, reasonable range is 60-180 BPM
+        max_bpm = 180  # Maximum expected BPM
+        min_beat_distance = int((60 / max_bpm) * self.sample_rate / self.hop_size)
+
+        # Find peaks with better parameters
+        peaks, properties = find_peaks(
+            energy_signal,
+            height=threshold,
+            distance=min_beat_distance,
+            prominence=mean_energy*0.3,  # Ensure significant peaks
+            width=2  # Minimum width of peaks
+        )
+
+        # Post-process: remove peaks that are too close together
+        if len(peaks) > 1:
+            final_peaks = [peaks[0]]
+            for i in range(1, len(peaks)):
+                if (peaks[i] - final_peaks[-1]) >= min_beat_distance:
+                    final_peaks.append(peaks[i])
+            peaks = np.array(final_peaks)
+
+        print(f"Detected {len(peaks)} beats with {method} method")
         return peaks
     
     def estimate_tempo(self, beat_times, method='autocorrelation'):
-        """Estimate tempo from beat intervals"""
-        if len(beat_times) < 2:
+        """Estimate tempo from beat intervals with octave error correction"""
+        if len(beat_times) < 3:
             return 0
-            
-        if method == 'interval':
-            # Simple average of intervals
-            intervals = np.diff(beat_times)
-            avg_interval = np.median(intervals)
-            tempo = 60.0 / avg_interval if avg_interval > 0 else 0
-            
-        elif method == 'autocorrelation':
-            # Use autocorrelation for more robust tempo estimation
-            beat_signal = np.zeros(int(beat_times[-1] * self.sample_rate) + 1)
-            for beat in beat_times:
-                idx = int(beat * self.sample_rate)
-                if idx < len(beat_signal):
-                    beat_signal[idx] = 1
-            
-            # Compute autocorrelation
-            correlation = np.correlate(beat_signal, beat_signal, mode='full')
-            correlation = correlation[len(correlation)//2:]
-            
-            # Find peaks in autocorrelation (excluding zero lag)
-            min_lag = int(0.3 * self.sample_rate)  # ~200 BPM max
-            max_lag = int(2.0 * self.sample_rate)  # ~30 BPM min
-            
-            correlation = correlation[min_lag:max_lag]
-            peaks, _ = find_peaks(correlation, distance=int(0.5 * self.sample_rate))
-            
-            if len(peaks) > 0:
-                main_peak = peaks[0] + min_lag
-                beat_period = main_peak / self.sample_rate
-                tempo = 60.0 / beat_period
-            else:
-                tempo = 0
+        
+        # Calculate all beat intervals
+        intervals = np.diff(beat_times)
+        
+        # Remove outliers (intervals that are too short or too long)
+        median_interval = np.median(intervals)
+        valid_intervals = intervals[(intervals > 0.3) & (intervals < 2.0)]
+        
+        if len(valid_intervals) == 0:
+            return 0
+        
+        # Calculate BPM from median interval
+        median_bpm = 60.0 / np.median(valid_intervals)
+        
+        # Common tempo ranges for music
+        common_tempos = [60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160, 170, 180]
+        
+        # Find the closest common tempo (correcting for octave errors)
+        best_tempo = median_bpm
+        best_error = abs(median_bpm - common_tempos[0])
+        
+        # Check normal tempo and possible octave errors (half and double)
+        for multiplier in [0.5, 1.0, 2.0]:
+            scaled_bpm = median_bpm * multiplier
+            for common_tempo in common_tempos:
+                error = abs(scaled_bpm - common_tempo)
+                if error < best_error and 60 <= scaled_bpm <= 180:
+                    best_error = error
+                    best_tempo = common_tempo
+        
+        # If we have enough beats, use autocorrelation for more accuracy
+        if method == 'autocorrelation' and len(beat_times) > 10:
+            try:
+                # Create a beat signal
+                duration = beat_times[-1]
+                time_resolution = 0.01  # 10ms resolution
+                time_points = int(duration / time_resolution)
+                beat_signal = np.zeros(time_points)
                 
-        return tempo
+                for beat in beat_times:
+                    idx = int(beat / time_resolution)
+                    if idx < len(beat_signal):
+                        beat_signal[idx] = 1
+                
+                # Compute autocorrelation
+                correlation = np.correlate(beat_signal, beat_signal, mode='full')
+                correlation = correlation[len(correlation)//2:]
+                
+                # Find peaks in reasonable tempo range (30-240 BPM)
+                min_lag = int(60/240 / time_resolution)  # 240 BPM
+                max_lag = int(60/30 / time_resolution)   # 30 BPM
+                
+                if max_lag < len(correlation):
+                    correlation_region = correlation[min_lag:max_lag]
+                    peaks, _ = find_peaks(correlation_region, 
+                                        distance=int(60/240 / time_resolution),
+                                        height=np.max(correlation_region)*0.3)
+                    
+                    if len(peaks) > 0:
+                        main_peak = peaks[0] + min_lag
+                        beat_period = main_peak * time_resolution
+                        autocorr_bpm = 60.0 / beat_period
+                        
+                        # Choose the most reasonable tempo
+                        if 60 <= autocorr_bpm <= 180:
+                            best_tempo = autocorr_bpm
+            except:
+                pass  # Fall back to interval method if autocorrelation fails
+        
+        return best_tempo
+
+    def estimate_tempo_improved(self, beat_times, method='autocorrelation'):
+        """Improved tempo estimation that avoids subdivision errors"""
+        if len(beat_times) < 3:
+            return 0
+        
+        # Calculate all beat intervals
+        intervals = np.diff(beat_times)
+        
+        # Remove outliers
+        median_interval = np.median(intervals)
+        valid_intervals = intervals[(intervals > 0.2) & (intervals < 2.0)]
+        
+        if len(valid_intervals) == 0:
+            return 0
+        
+        # Calculate raw BPM from median interval
+        raw_bpm = 60.0 / np.median(valid_intervals)
+        
+        # Common musical tempos (focus on typical pop/EDM ranges)
+        common_tempos = [60, 65, 70, 75, 80, 85, 90, 95, 100, 105, 110, 115, 120, 
+                         125, 130, 135, 140, 145, 150, 155, 160, 165, 170, 175, 180]
+        
+        # Check for tempo doubling/halving (common errors)
+        candidate_tempos = []
+        
+        for multiplier in [0.5, 1.0, 2.0]:  # Check half, normal, and double tempo
+            candidate = raw_bpm * multiplier
+            
+            # Only consider reasonable musical tempos
+            if 60 <= candidate <= 180:
+                # Find closest common tempo
+                closest_tempo = min(common_tempos, key=lambda x: abs(x - candidate))
+                error = abs(candidate - closest_tempo)
+                candidate_tempos.append((closest_tempo, error, multiplier))
+        
+        if not candidate_tempos:
+            return raw_bpm
+        
+        # Prefer the candidate with smallest error to common tempo
+        candidate_tempos.sort(key=lambda x: x[1])  # Sort by error
+        
+        # But strongly prefer the 1.0 multiplier (original tempo) if error is reasonable
+        normal_tempo_candidates = [c for c in candidate_tempos if c[2] == 1.0]
+        if normal_tempo_candidates and normal_tempo_candidates[0][1] < 10:
+            best_tempo = normal_tempo_candidates[0][0]
+        else:
+            best_tempo = candidate_tempos[0][0]
+        
+        # Additional check: if detected tempo is very high (>150), consider it might be doubled
+        if best_tempo > 150:
+            # Check if half tempo would be more musically common
+            half_tempo = best_tempo / 2
+            closest_half = min(common_tempos, key=lambda x: abs(x - half_tempo))
+            if abs(half_tempo - closest_half) < 5:  # If half tempo is very close to a common tempo
+                best_tempo = closest_half
+        
+        return best_tempo
 
     def analyze_audio_file(self, file_path, visualize=True):
         """Complete analysis of an audio file"""
@@ -161,25 +281,28 @@ class BeatDetector:
         # Update sample rate if different from loaded file
         if sr != self.sample_rate:
             self.sample_rate = sr
-            
+        
         audio = self.bandpass_filter(audio)
         
         # Compute features
         energy = self.compute_energy(audio)
         spectral_flux = self.compute_spectral_flux(audio)
         
-        # Detect beats
-        energy_beats = self.detect_beats(energy)
-        flux_beats = self.detect_beats(spectral_flux, threshold_factor=1.3)
+        # Detect beats with appropriate thresholds
+        energy_beats = self.detect_beats(energy, threshold_factor=1.2, method='energy')
+        flux_beats = self.detect_beats(spectral_flux, threshold_factor=0.5, method='flux')  # Lower threshold for flux
         
         # Convert to time
         time_axis = np.arange(len(energy)) * self.hop_size / sr
         energy_beat_times = time_axis[energy_beats]
         flux_beat_times = time_axis[flux_beats]
         
+        # Debug the intervals
+        self.debug_beat_intervals(energy_beat_times, file_path)
+        
         # Estimate tempo
         tempo_energy = self.estimate_tempo(energy_beat_times)
-        tempo_flux = self.estimate_tempo(flux_beat_times)
+        tempo_flux = self.estimate_tempo(flux_beat_times) if len(flux_beat_times) > 1 else 0
         
         print(f"\n=== RESULTS ===")
         print(f"Tempo (Energy method): {tempo_energy:.1f} BPM")
@@ -197,6 +320,148 @@ class BeatDetector:
             'tempo_flux': tempo_flux,
             'energy_beats': energy_beat_times,
             'flux_beats': flux_beat_times,
+            'audio_length': len(audio)/sr
+        }
+    
+    def analyze_audio_file_enhanced(self, file_path, visualize=True):
+        """Enhanced analysis with dynamic thresholding, tempo smoothing, and downbeat detection"""
+        print(f"\n=== ENHANCED ANALYSIS: {file_path} ===")
+        
+        # Load and process audio
+        audio, sr = self.load_audio(file_path)
+        if audio is None:
+            return None
+            
+        if sr != self.sample_rate:
+            self.sample_rate = sr
+        
+        audio = self.bandpass_filter(audio)
+        
+        # Compute features
+        energy = self.compute_energy(audio)
+        spectral_flux = self.compute_spectral_flux(audio)
+        time_axis = np.arange(len(energy)) * self.hop_size / sr
+        
+        # Detect beats with dynamic thresholding
+        energy_beats = self.detect_beats_dynamic(energy, 'energy')
+        flux_beats = self.detect_beats_dynamic(spectral_flux, 'flux')
+        
+        energy_beat_times = time_axis[energy_beats]
+        flux_beat_times = time_axis[flux_beats]
+        
+        # Downbeat detection
+        downbeats, weak_beats = self.detect_downbeats(energy_beats, energy, time_axis)
+        downbeat_times = time_axis[downbeats]
+        
+        # Tempo analysis over time
+        energy_tempos, tempo_times = self.analyze_tempo_over_time(energy_beat_times)
+        smoothed_tempos = self.smooth_tempo(energy_tempos) if energy_tempos else []
+        
+        # Final tempo estimates
+        tempo_energy = self.estimate_tempo(energy_beat_times)
+        tempo_flux = self.estimate_tempo(flux_beat_times) if len(flux_beat_times) > 1 else 0
+        
+        # Use energy tempo as primary, fallback to flux if needed
+        final_tempo = tempo_energy if tempo_energy > 0 else tempo_flux
+        
+        print(f"\n=== ENHANCED RESULTS ===")
+        print(f"Primary Tempo: {final_tempo:.1f} BPM")
+        print(f"Energy Method: {tempo_energy:.1f} BPM")
+        print(f"Flux Method: {tempo_flux:.1f} BPM")
+        print(f"Downbeats Detected: {len(downbeats)}")
+        print(f"Weak Beats: {len(weak_beats)}")
+        
+        if smoothed_tempos:
+            print(f"Tempo Range: {min(smoothed_tempos):.1f}-{max(smoothed_tempos):.1f} BPM")
+            print(f"Tempo Stability: {np.std(smoothed_tempos):.1f} BPM std dev")
+        
+        if visualize:
+            self.visualize_enhanced_results(audio, sr, energy, spectral_flux,
+                                          energy_beat_times, downbeat_times,
+                                          smoothed_tempos, tempo_times,
+                                          flux_beat_times)
+        
+        return {
+            'final_tempo': final_tempo,
+            'tempo_energy': tempo_energy,
+            'tempo_flux': tempo_flux,
+            'energy_beats': energy_beat_times,
+            'flux_beats': flux_beat_times,
+            'downbeats': downbeat_times,
+            'weak_beats': weak_beats,
+            'tempo_over_time': smoothed_tempos,
+            'tempo_times': tempo_times,
+            'audio_length': len(audio)/sr
+        }
+    
+    def analyze_audio_file_enhanced_v2(self, file_path, visualize=True):
+        """Version 2 with improved tempo estimation and downbeat detection"""
+        print(f"\n=== ENHANCED ANALYSIS V2: {file_path} ===")
+        
+        # Load and process audio
+        audio, sr = self.load_audio(file_path)
+        if audio is None:
+            return None
+            
+        if sr != self.sample_rate:
+            self.sample_rate = sr
+        
+        audio = self.bandpass_filter(audio)
+        
+        # Compute features
+        energy = self.compute_energy(audio)
+        spectral_flux = self.compute_spectral_flux(audio)
+        time_axis = np.arange(len(energy)) * self.hop_size / sr
+        
+        # Detect beats with dynamic thresholding
+        energy_beats = self.detect_beats_dynamic(energy, 'energy')
+        flux_beats = self.detect_beats_dynamic(spectral_flux, 'flux')
+        
+        energy_beat_times = time_axis[energy_beats]
+        flux_beat_times = time_axis[flux_beats]
+        
+        # Use improved tempo estimation
+        tempo_energy = self.estimate_tempo_improved(energy_beat_times)
+        tempo_flux = self.estimate_tempo_improved(flux_beat_times) if len(flux_beat_times) > 1 else 0
+        
+        # Use improved downbeat detection
+        downbeats, weak_beats = self.detect_downbeats_improved(energy_beat_times, energy, time_axis, tempo_energy)
+        downbeat_times = time_axis[downbeats] if hasattr(downbeats, '__len__') else np.array([])
+        
+        # Tempo analysis over time
+        energy_tempos, tempo_times = self.analyze_tempo_over_time(energy_beat_times)
+        smoothed_tempos = self.smooth_tempo(energy_tempos) if energy_tempos else []
+        
+        # Use energy tempo as primary, fallback to flux if needed
+        final_tempo = tempo_energy if tempo_energy > 0 else tempo_flux
+        
+        print(f"\n=== ENHANCED RESULTS V2 ===")
+        print(f"Primary Tempo: {final_tempo:.1f} BPM")
+        print(f"Energy Method: {tempo_energy:.1f} BPM")
+        print(f"Flux Method: {tempo_flux:.1f} BPM")
+        print(f"Downbeats Detected: {len(downbeats)}")
+        print(f"Weak Beats: {len(weak_beats)}")
+        
+        if smoothed_tempos:
+            print(f"Tempo Range: {min(smoothed_tempos):.1f}-{max(smoothed_tempos):.1f} BPM")
+            print(f"Tempo Stability: {np.std(smoothed_tempos):.1f} BPM std dev")
+        
+        if visualize:
+            self.visualize_enhanced_results(audio, sr, energy, spectral_flux,
+                                            energy_beat_times, downbeat_times,
+                                            smoothed_tempos, tempo_times,
+                                            flux_beat_times)
+        
+        return {
+            'final_tempo': final_tempo,
+            'tempo_energy': tempo_energy,
+            'tempo_flux': tempo_flux,
+            'energy_beats': energy_beat_times,
+            'flux_beats': flux_beat_times,
+            'downbeats': downbeat_times,
+            'weak_beats': weak_beats,
+            'tempo_over_time': smoothed_tempos,
+            'tempo_times': tempo_times,
             'audio_length': len(audio)/sr
         }
     
@@ -251,6 +516,313 @@ class BeatDetector:
         plt.tight_layout()
         plt.show()
 
+    def visualize_enhanced_results(self, audio, sr, energy, spectral_flux,
+                                  energy_beat_times, downbeat_times,
+                                  tempo_over_time, tempo_times, 
+                                  flux_beat_times=None):
+        """Enhanced visualization with all new features"""
+        print("Generating enhanced visualization...")
+        
+        # Create a more comprehensive figure
+        fig, axes = plt.subplots(5, 1, figsize=(15, 12))
+        
+        time_axis_audio = np.arange(len(audio)) / sr
+        time_axis_features = np.arange(len(energy)) * self.hop_size / sr
+        
+        # Plot 1: Original audio with all beat types
+        axes[0].plot(time_axis_audio, audio, alpha=0.7, linewidth=0.8)
+        
+        # Plot different beat types with different colors and markers
+        if len(energy_beat_times) > 0:
+            # Regular beats (smaller, lighter)
+            beat_indices = [np.argmin(np.abs(time_axis_features - t)) for t in energy_beat_times]
+            beat_amplitudes = [energy[i] for i in beat_indices]
+            axes[0].scatter(energy_beat_times, [0] * len(energy_beat_times), 
+                           color='red', marker='o', s=20, alpha=0.6, label='Beats')
+        
+        if len(downbeat_times) > 0:
+            # Downbeats (larger, darker)
+            downbeat_indices = [np.argmin(np.abs(time_axis_features - t)) for t in downbeat_times]
+            downbeat_amplitudes = [energy[i] for i in downbeat_indices]
+            axes[0].scatter(downbeat_times, [0] * len(downbeat_times), 
+                           color='darkred', marker='o', s=80, alpha=0.9, label='Downbeats')
+        
+        axes[0].set_title('Audio Signal with Beat Detection (Red=Beats, Dark Red=Downbeats)')
+        axes[0].set_xlabel('Time (s)')
+        axes[0].set_ylabel('Amplitude')
+        axes[0].legend()
+        axes[0].grid(True, alpha=0.3)
+        
+        # Plot 2: Energy envelope with dynamic threshold
+        axes[1].plot(time_axis_features, energy, 'b-', linewidth=1, label='Energy')
+        
+        # Calculate and plot dynamic threshold
+        dynamic_thresh = self.dynamic_threshold(energy)
+        axes[1].plot(time_axis_features, dynamic_thresh, 'r--', linewidth=1, label='Dynamic Threshold')
+        
+        # Mark beats on energy plot
+        if len(energy_beat_times) > 0:
+            beat_indices = [np.argmin(np.abs(time_axis_features - t)) for t in energy_beat_times]
+            beat_energies = [energy[i] for i in beat_indices]
+            axes[1].scatter(energy_beat_times, beat_energies, color='red', s=30, alpha=0.8)
+        
+        axes[1].set_title('Energy Envelope with Dynamic Thresholding')
+        axes[1].set_xlabel('Time (s)')
+        axes[1].set_ylabel('Energy')
+        axes[1].legend()
+        axes[1].grid(True, alpha=0.3)
+        
+        # Plot 3: Spectral flux
+        axes[2].plot(time_axis_features, spectral_flux, 'orange', linewidth=1, label='Spectral Flux')
+        
+        # Mark spectral flux beats if available
+        if flux_beat_times is not None and len(flux_beat_times) > 0:
+            flux_beat_indices = [np.argmin(np.abs(time_axis_features - t)) for t in flux_beat_times]
+            flux_beat_values = [spectral_flux[i] for i in flux_beat_indices]
+            axes[2].scatter(flux_beat_times, flux_beat_values, color='purple', s=30, alpha=0.8, label='Flux Beats')
+        
+        axes[2].set_title('Spectral Flux')
+        axes[2].set_xlabel('Time (s)')
+        axes[2].set_ylabel('Spectral Flux')
+        axes[2].legend()
+        axes[2].grid(True, alpha=0.3)
+        
+        # Plot 4: Tempo over time (if we have tempo analysis)
+        if tempo_over_time and len(tempo_over_time) > 0:
+            axes[3].plot(tempo_times, tempo_over_time, 'g-', linewidth=2, label='Tempo')
+            axes[3].axhline(y=np.mean(tempo_over_time), color='r', linestyle='--', 
+                           label=f'Average: {np.mean(tempo_over_time):.1f} BPM')
+            axes[3].set_title('Tempo Analysis Over Time')
+            axes[3].set_xlabel('Time (s)')
+            axes[3].set_ylabel('Tempo (BPM)')
+            axes[3].set_ylim(max(60, np.min(tempo_over_time)-10), np.max(tempo_over_time)+10)
+            axes[3].legend()
+            axes[3].grid(True, alpha=0.3)
+        else:
+            axes[3].text(0.5, 0.5, 'Insufficient data for tempo analysis over time', 
+                        ha='center', va='center', transform=axes[3].transAxes)
+            axes[3].set_title('Tempo Analysis Over Time')
+            axes[3].set_xlabel('Time (s)')
+            axes[3].set_ylabel('Tempo (BPM)')
+        
+        # Plot 5: Beat intervals and downbeat pattern
+        if len(energy_beat_times) > 1:
+            intervals = np.diff(energy_beat_times)
+            axes[4].plot(energy_beat_times[1:], intervals, 'bo-', markersize=3, linewidth=1, label='Beat Intervals')
+            
+            # Mark downbeats on interval plot
+            if len(downbeat_times) > 0:
+                downbeat_intervals = []
+                downbeat_times_plot = []
+                for i, beat_time in enumerate(energy_beat_times[1:], 1):
+                    if energy_beat_times[i-1] in downbeat_times:
+                        downbeat_intervals.append(intervals[i-1])
+                        downbeat_times_plot.append(beat_time)
+                
+                if downbeat_intervals:
+                    axes[4].scatter(downbeat_times_plot, downbeat_intervals, 
+                                   color='darkred', s=50, label='Downbeat Intervals')
+            
+            axes[4].axhline(y=np.mean(intervals), color='r', linestyle='--', 
+                           label=f'Avg: {np.mean(intervals):.3f}s')
+            axes[4].set_title('Beat Intervals (Circles=Downbeats)')
+            axes[4].set_xlabel('Time (s)')
+            axes[4].set_ylabel('Interval (s)')
+            axes[4].legend()
+            axes[4].grid(True, alpha=0.3)
+        else:
+            axes[4].text(0.5, 0.5, 'Insufficient beats for interval analysis', 
+                        ha='center', va='center', transform=axes[4].transAxes)
+            axes[4].set_title('Beat Intervals')
+            axes[4].set_xlabel('Time (s)')
+            axes[4].set_ylabel('Interval (s)')
+        
+        plt.tight_layout()
+        plt.show()
+
+    def debug_beat_intervals(self, beat_times, filename):
+        """Debug method to analyze beat intervals"""
+        if len(beat_times) < 2:
+            return
+        
+        intervals = np.diff(beat_times)
+        
+        # Determine expected tempo from filename
+        if "90bpm" in filename:
+            expected_tempo = 90
+        elif "120bpm" in filename:
+            expected_tempo = 120
+        elif "140bpm" in filename:
+            expected_tempo = 140
+        else:
+            expected_tempo = 120  # Default
+        
+        expected_interval = 60.0 / expected_tempo
+        
+        print(f"\n🔍 BEAT INTERVAL DEBUG for {filename}:")
+        print(f"Expected interval: {expected_interval:.3f}s ({expected_tempo} BPM)")
+        print(f"Detected {len(intervals)} intervals:")
+        print(f"  Min: {np.min(intervals):.3f}s")
+        print(f"  Max: {np.max(intervals):.3f}s") 
+        print(f"  Mean: {np.mean(intervals):.3f}s")
+        print(f"  Median: {np.median(intervals):.3f}s")
+        
+        detected_bpm = 60.0 / np.median(intervals)
+        print(f"  Detected BPM: {detected_bpm:.1f}")
+
+    def dynamic_threshold(self, signal, window_size=50):
+        """Calculate dynamic threshold based on local signal characteristics"""
+        threshold_signal = np.zeros_like(signal)
+        
+        for i in range(len(signal)):
+            start = max(0, i - window_size // 2)
+            end = min(len(signal), i + window_size // 2)
+            
+            window = signal[start:end]
+            local_mean = np.mean(window)
+            local_std = np.std(window)
+            
+            # Dynamic threshold: mean + scaled standard deviation
+            threshold_signal[i] = local_mean + (local_std * 0.5)
+        
+        return threshold_signal
+
+    def detect_beats_dynamic(self, energy_signal, method='energy'):
+        """Detect beats with dynamic thresholding"""
+        print(f"Using dynamic thresholding for {method} method...")
+        
+        # Calculate dynamic threshold
+        dynamic_thresh = self.dynamic_threshold(energy_signal)
+        
+        # Minimum distance between beats (for 240 BPM max)
+        min_beat_distance = int((60 / 240) * self.sample_rate / self.hop_size)
+        
+        # Find peaks that exceed dynamic threshold
+        peaks, properties = find_peaks(
+            energy_signal, 
+            height=dynamic_thresh,
+            distance=min_beat_distance,
+            prominence=np.mean(energy_signal)*0.2
+        )
+        
+        print(f"Detected {len(peaks)} beats with dynamic thresholding")
+        return peaks
+    
+    def analyze_tempo_over_time(self, beat_times, window_size=8):
+        """Analyze tempo changes over time using sliding windows"""
+        if len(beat_times) < window_size + 1:
+            return [self.estimate_tempo(beat_times)], beat_times[window_size//2:len(beat_times)-window_size//2]
+        
+        tempos = []
+        window_centers = []
+        
+        for i in range(len(beat_times) - window_size):
+            window_beats = beat_times[i:i + window_size]
+            window_tempo = self.estimate_tempo(window_beats)
+            
+            # Only include reasonable tempo values
+            if 60 <= window_tempo <= 200:
+                tempos.append(window_tempo)
+                window_centers.append(beat_times[i + window_size // 2])
+        
+        return tempos, window_centers
+
+    def smooth_tempo(self, tempos, window_size=3):
+        """Smooth tempo sequence using moving average"""
+        if len(tempos) < window_size:
+            return tempos
+        
+        smoothed = []
+        for i in range(len(tempos)):
+            start = max(0, i - window_size // 2)
+            end = min(len(tempos), i + window_size // 2 + 1)
+            window = tempos[start:end]
+            smoothed.append(np.median(window))
+        
+        return smoothed
+    
+    def detect_downbeats(self, beat_times, energy_signal, time_axis):
+        """Identify strong (downbeats) vs weak beats"""
+        if len(beat_times) < 4:
+            return np.array([]), np.array([])
+        
+        # Get energy values at beat positions
+        beat_energies = energy_signal[beat_times]
+        
+        # Normalize energies
+        beat_energies = (beat_energies - np.min(beat_energies)) / (np.max(beat_energies) - np.min(beat_energies))
+        
+        # Group beats into measures (assuming 4/4 time)
+        downbeats = []
+        weak_beats = []
+        
+        for i in range(len(beat_times)):
+            if i % 4 == 0:  # Assume first beat of measure is strongest
+                # Check if this beat has high energy relative to neighbors
+                if i > 0 and i < len(beat_times) - 1:
+                    local_avg = np.mean(beat_energies[max(0, i-2):min(len(beat_energies), i+3)])
+                    if beat_energies[i] > local_avg * 1.2:
+                        downbeats.append(beat_times[i])
+                    else:
+                        weak_beats.append(beat_times[i])
+                else:
+                    downbeats.append(beat_times[i])
+            else:
+                weak_beats.append(beat_times[i])
+        
+        print(f"Detected {len(downbeats)} downbeats and {len(weak_beats)} weak beats")
+        return np.array(downbeats), np.array(weak_beats)
+    
+    def detect_downbeats_improved(self, beat_times, energy_signal, time_axis, expected_tempo=None):
+        """Improved downbeat detection using energy patterns and musical knowledge"""
+        if len(beat_times) < 8:  # Need enough beats for pattern recognition
+            return np.array([]), beat_times
+        
+        # Get energy values at beat positions
+        beat_indices = [np.argmin(np.abs(time_axis - t)) for t in beat_times]
+        beat_energies = energy_signal[beat_indices]
+        
+        # Normalize energies
+        if np.max(beat_energies) > np.min(beat_energies):
+            beat_energies = (beat_energies - np.min(beat_energies)) / (np.max(beat_energies) - np.min(beat_energies))
+        
+        # Try to detect measure boundaries (4/4 time assumption)
+        downbeats = []
+        weak_beats = []
+        
+        # Use multiple strategies
+        energy_threshold = np.mean(beat_energies) + 0.5 * np.std(beat_energies)
+        
+        for i in range(len(beat_times)):
+            is_downbeat = False
+            
+            # Strategy 1: Every 4th beat (simple 4/4 assumption)
+            if i % 4 == 0:
+                is_downbeat = True
+            
+            # Strategy 2: High energy beats
+            if beat_energies[i] > energy_threshold:
+                is_downbeat = True
+            
+            # Strategy 3: Look for energy peaks in local context
+            if i >= 2 and i < len(beat_times) - 2:
+                local_energies = beat_energies[i-2:i+3]
+                if beat_energies[i] == np.max(local_energies):
+                    is_downbeat = True
+            
+            if is_downbeat:
+                downbeats.append(beat_times[i])
+            else:
+                weak_beats.append(beat_times[i])
+        
+        # If we found too few downbeats, use simpler method
+        if len(downbeats) < len(beat_times) / 8:
+            downbeats = beat_times[::4]  # Every 4th beat
+            weak_beats = [t for t in beat_times if t not in downbeats]
+        
+        print(f"Detected {len(downbeats)} downbeats and {len(weak_beats)} weak beats")
+        return np.array(downbeats), np.array(weak_beats)
+    
 def real_time_beat_detection():
     """Real-time beat detection using microphone input"""
     print("Starting real-time beat detection...")
@@ -302,7 +874,12 @@ def main():
         if os.path.exists(args.file):
             results = detector.analyze_audio_file(args.file)
             if results:
-                print(f"\nFinal Tempo Estimate: {np.mean([results['tempo_energy'], results['tempo_flux']]):.1f} BPM")
+                if results['tempo_flux'] > 0:
+                    final_tempo = np.mean([results['tempo_energy'], results['tempo_flux']])
+                else:
+                    final_tempo = results['tempo_energy']  # Use energy method if flux fails
+
+                print(f"\nFinal Tempo Estimate: {final_tempo:.1f} BPM")
         else:
             print(f"File not found: {args.file}")
     else:
