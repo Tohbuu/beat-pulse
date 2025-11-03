@@ -4,3 +4,4 @@ librosa
 matplotlib
 sounddevice
 soundfile
+pandas
