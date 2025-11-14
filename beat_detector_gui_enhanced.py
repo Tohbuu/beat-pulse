@@ -631,12 +631,32 @@ with {'clear' if len(self.results.get('downbeats', [])) > len(self.results['ener
         """Create a new window for visualization display (preserves original behavior)"""
         self.current_visualization_window = tk.Toplevel(self.root)
         self.current_visualization_window.title(f"Visualization - {os.path.basename(self.current_file) if self.current_file else 'untitled'}")
-        self.current_visualization_window.geometry("1400x900")
-        self.current_visualization_window.minsize(1000, 700)
+        
+        # Get screen dimensions
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        
+        # Maximize the window - try platform-specific methods
+        try:
+            self.current_visualization_window.state('zoomed')  # Windows
+        except tk.TclError:
+            try:
+                self.current_visualization_window.attributes('-zoomed', True)  # Linux
+            except tk.TclError:
+                try:
+                    self.current_visualization_window.attributes('-maximized', True)  # macOS
+                except tk.TclError:
+                    # Fallback: set to screen size with padding
+                    self.current_visualization_window.geometry(f"{int(screen_width * 0.95)}x{int(screen_height * 0.95)}+0+0")
+    
+        # Set minimum size to allow further resizing
+        self.current_visualization_window.minsize(800, 600)
 
         # Create main container with scrollbars
         main_container = ttk.Frame(self.current_visualization_window)
-        main_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        main_container.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        main_container.grid_rowconfigure(0, weight=1)
+        main_container.grid_columnconfigure(0, weight=1)
 
         # Create scrollable canvas
         viz_canvas = tk.Canvas(main_container, bg='#2b2b2b', highlightthickness=0)
@@ -924,6 +944,22 @@ with {'clear' if len(self.results.get('downbeats', [])) > len(self.results['ener
         # Show the figure in a new window
         new_window = tk.Toplevel(self.root)
         new_window.title(f"Visualization - {viz_info['file']}")
+        
+        # Maximize window
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        try:
+            new_window.state('zoomed')  # Windows
+        except tk.TclError:
+            try:
+                new_window.attributes('-zoomed', True)  # Linux
+            except tk.TclError:
+                try:
+                    new_window.attributes('-maximized', True)  # macOS
+                except tk.TclError:
+                    new_window.geometry(f"{int(screen_width * 0.95)}x{int(screen_height * 0.95)}+0+0")
+    
+        new_window.minsize(800, 600)
 
         # Add controls
         controls_frame = ttk.Frame(new_window)
@@ -936,6 +972,7 @@ with {'clear' if len(self.results.get('downbeats', [])) > len(self.results['ener
 
         canvas = FigureCanvasTkAgg(fig, master=new_window)
         canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        
         toolbar = NavigationToolbar2Tk(canvas, new_window)
         toolbar.update()
         toolbar.pack(side=tk.BOTTOM, fill=tk.X)
