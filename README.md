@@ -202,11 +202,6 @@ python test_enhanced_system.py
 python real_time_detector.py --simple
 ```
 
-**Complete System Test:**
-```bash
-python run_complete_test.py
-```
-
 ### Option C: Genre Analysis
 
 **Setup Music Directory:**
@@ -411,7 +406,6 @@ dsp-project/
 ├── demo_signal.py                 # Demo file generator
 ├── test_installation.py           # Dependency checker
 ├── test_enhanced_system.py        # Enhanced features test
-├── run_complete_test.py           # Comprehensive test suite
 ├── genre_analysis.py              # Genre analysis tool
 ├── download_organizer.py          # Music directory organizer
 ├── quick_genre_test.py            # Quick genre testing
